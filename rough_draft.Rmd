@@ -1,0 +1,230 @@
+---
+title: "Using Voice Features to Predict Extraversion and Openness"
+author: "Josh Winnes, Andrew Howe, and Jeremiah Cho"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: sandstone
+---
+
+# 1. Abstract
+
+We decided to strip some videos of people interviewing for loans of the video portion and only examine their voice data. Our dataset explores how certain aspects of one’s voice can lead to predicting certain outcome characteristics. Using techniques such as bagging, random forests,gradient boosting, principal component analysis, and neural networks, we tried to see how well our predictors contributed to our outcome variables of extraversion and openness. We found that random forest and gradient boosting were the best models for predicting extraversion and openness.
+
+# 2. Introduction
+
+We are interested in the relationship between a speaker's voice and their personality traits. Specifically, we are interested in seeing if quantifiable voice features (such as fundamental frequency or zero-crossing rate) can be used to accurately measure the components of a speaker's personality. One common way of quantifying a speaker's personality is to use the OCEAN model. This model is analogous to the primary colors in color theory. The idea is that one's unique personality can be divided up into different proportions of the five main personality traits: Openness (O), Conscientiousness (C), Extraversion (E), Agreeableness (A), and Neuroticism (N). A description of each of these traits can be found in the [VPTD: Human Face Video Dataset for Personality Traits Detection](https://www.mdpi.com/2306-5729/8/7/113) study conducted by Kenan Kassab, Alexey Kashevnik, Alexander Mayatin, and Dmitry Zubok. This study was central to our exploration.
+
+## 2.1 The Data
+
+The initial data was sourced from the [VPTD: Human Face Video Dataset for Personality Traits Detection](https://www.mdpi.com/2306-5729/8/7/113) study which was originally a study conducted on video interviews. In the study, the researchers developed a model that could take a 2-3 minute video interview and score the interviewee's personality on the OCEAN scale. The goal of the original study was to predict sales ability in order to provide extra data points for a company looking to hire new salespeople. However, we used the data as ground truth; although the orignal intent was for video data, these interviews were essentially audio files with labeled OCEAN personality scores. The raw data is public and can be accessed [here](https://zenodo.org/records/8068262). 
+
+## 2.2 Preprocessing
+
+This data is extremely limited and only has 36 observations. To address this problem, we stripped the audio from the video clips and employed a public [voice diarization model](https://github.com/pyannote/pyannote-audio) available on GitHub to automatically detect and split the clips into thier voiced and unvoiced segments. We then extracted the raw audio features using [OpenSMILE](https://audeering.github.io/opensmile-python/index.html), another public audio processing API. This gave us a dataset with 617 observations of 96 predictors and 5 labels (one for each OCEAN quality). To this extent, preprocessing was conducted in Python and the rest of the model development was done in R. In this paper, we focus on predicting Extraversion and Openness.
+
+# 3. Exploratory Data Analysis
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(GGally)
+library(cowplot)
+
+library(tidyverse)
+library(rsample)
+library(tidymodels)
+library(GGally)
+library(themis)
+```
+
+```{r, echo=F, include=F}
+library(rsample)
+
+set.seed(12345)
+
+data_name = 'voiced_labeled.csv'
+voice_labeled = read_csv(data_name)
+glimpse(voice_labeled)
+
+voiced_labeled = read_csv('voiced_labeled.csv')
+
+voiced_split = initial_split(voiced_labeled, prop=0.8)
+voiced_train = training(voiced_split)
+voiced_test = testing(voiced_split)
+```
+
+### 3.1 Distribution of Gender and Age
+
+```{r, warning = FALSE, echo=F}
+gender <- ggplot(voice_labeled, aes(x = male)) + geom_histogram(bins = 15, color="white", fill = "darkblue") + 
+  labs(
+    x = "Male",
+    y = "Count",
+    title = "Distribution of Male (1) vs. Female (0) Observations")
+
+age <- ggplot(voice_labeled, aes(x = age)) + geom_histogram(bins = 15, color='white', fill = "darkblue") + labs(
+  x = "Age (Years)",
+  y = "Count",
+  title = "Distribution of Age of Speakers")
+
+gender
+age
+
+```
+
+### 3.2 Distribution of our Outcome Variables
+
+```{r, warning = FALSE, echo=F}
+extraversion <- ggplot(voice_labeled, aes(x = Extraversion)) + geom_histogram(bins = 15, color = "white", fill = "darkblue") + labs(x = "Extraversion")
+
+openness <- ggplot(voice_labeled, aes(x = Openness)) + geom_histogram(bins = 15, color = "white", fill = "darkblue") + labs(x = "Openness")
+
+extraversion
+openness
+```
+
+
+### 3.3 Correlation
+
+```{r echo=F, warning=F}
+po_pairs <- ggpairs(data = voice_labeled, columns = c(3, 5, 9, 11, 21, 41, 77, 92, 94, 96, 99, 103), color="darkblue") +
+  labs(
+    title="Correlation and Distribution of Key Predictors and Outcome Variables"
+  )
+
+ggsave("po_pairs.png", plot = po_pairs, width = 15, height = 15, dpi = 300)
+knitr::include_graphics("po_pairs.png")
+```
+
+
+We found it to be difficult to find any correlation between any single predictor and extraversion and openness as our outcome variables. Most of the predictors and outcome variables followed a typical normal distribution. The correlation we tried to show can be seen in the above ggpairs plot. 
+
+
+# 4. Methods
+
+## 4.1 Extraversion
+
+### 4.1.1 Principle Component Analysis
+
+To predict extraversion, we began by exploring the principle components of the dataset. This is because there are so many predictors and we felt that it would be helpful to reduce the dimensionality of our prediction space. 
+
+```{r include=F, echo=F}
+pca_voiced_rec = recipe(Extraversion ~ ., data=voiced_train) |>
+  step_rm(file_name, file_id, Openness, Conscientiousness, Agreeableness, Neuroticism) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_pca(
+    all_numeric_predictors(),
+    threshold = 1
+  )
+
+pca_voiced_prep = pca_voiced_rec |>
+  prep()
+pca_voiced_baked = pca_voiced_prep |>
+  bake(new_data=NULL)
+
+tidied_voiced_pca = tidy(pca_voiced_baked, 3)
+
+tidied_voiced_vars <- tidy(pca_voiced_prep, 3, type="variance")
+```
+
+```{r echo=F}
+tidied_voiced_vars |>
+  filter(terms=="cumulative percent variance") |>
+  ggplot(aes(component, value)) + 
+  geom_line() + 
+  geom_point(color="darkblue") + 
+  labs(x="Number of Components", title="Percent Variance Explained by Cumulative Components", y="Percent Explained")
+```
+
+The figure above shows that although we could reduce the dimensionality of our prediction space using Principle Component Analysis, we still needed between 40 and 50 principle components in order to cover our desired threshold of 95% of the variance in the data. Even though this isn't ideal, we figured it would could still produce better results than a prediction space of 96 dimensions so we moved forward with this recipe with a threshold of 95%. However, given how many principle components we still needed, we also moved forward with a recipe that didn't involve any principle components and left the prediction space un-transformed. 
+
+### 4.1.2 Preprocessing
+
+We applied the following preprocessing steps to our two recipes:
+
+- **PCA Recipe**
+  - Remove nominal predictors (i.e. `filename`, `file_id`, and the other OCEAN traits)
+  - Normalize all numeric predictors
+  - SMOTE (for class imbalance)
+  - PCA (`threshold` = 0.95, all numeric predictors)
+  
+- **No PCA Recipe**
+  - Remove nominal predictors (i.e. `filename`, `file_id`, and the other OCEAN traits)
+  - Normalize all numeric predictors
+  - SMOTE (for class imbalance)
+
+### 4.1.2 Models
+
+We then trained 5 different algorithms (random forest regressor, gradient boosting tree, mulitlayer perceptron regressor, bagged multilayer perceptron regressor, and polynomial support vector machine regressor) on both recipes and 7-fold CV with 5 repeats for a total of 350 fits. From these early models we could see that our No-PCA recipe was performing much better than our PCA recipe with Random Forest and Gradient Boosting models performing significantly better than the other three. We pursued those models for further tuning.
+
+### 4.1.4 Refinement
+
+Once we knew which models we were going to focus on, we could tune all the hyperparameters to optimize them. The hyperparameters we chose to tune are listed below.
+
+- **Random Forest**
+  - `trees`: Number of trees in the forest
+  - `min_n`: Minimum number of observations for a node 
+
+- **Gradient Boosting Tree**
+  - `trees`: Number of trees
+  - `tree_depth`: Maximum tree depth
+  - `learn_rate`: Learning rate for gradient descent
+  - `min_n`: Minimum number of observations for a node
+
+## 4.2 Openness
+
+
+
+# 5. Results
+
+## 5.1 Extraversion
+
+The metrics of both the Random Forest and the Gradient Boosting model are given in the tables below.
+
+```{r, echo=F, include=F}
+rf_extra = readRDS("extraversion_rf1.rds")
+boost_extra = readRDS("extraversion_bst_tree1.rds")
+
+rf_results = rf_extra |>
+  augment(voiced_test)
+
+boost_results = boost_extra |>
+  augment(voiced_test)
+
+metrics = metric_set(rmse, rsq)
+```
+
+**Random Forest Metrics**
+
+```{r echo=F, message=F, warning=F}
+library(knitr)
+metrics(rf_results, truth = Extraversion, estimate=.pred) |> kable()
+```
+
+**Gradient Boosting Metrics**
+
+```{r message=F, warning=F, echo=F}
+metrics(boost_results, truth=Extraversion, estimate=.pred) |> kable()
+```
+
+These results indicate that it is possible to predict the extraversion of a speaker with a pretty good deal of accuracy. With more and better data, we believe that these results could be improved even further.
+
+## 5.2 Openness
+
+# 6. Conclusion
+
+# 7. AI Statement
+
+I used ChatGPT to help me figure out the GGPairs syntax as well as how to increase the size of the GGPairs plot and how to include it into the knitted HTML file. (Jeremiah Cho)
+
+I used ChatGPT to help me remember how to build a workflow set (along with HW5) and also to find the `kable()` function which makes HTML output of tibbles much neater. (Josh Winnes)
+
+
+
+
+
+
